@@ -9,6 +9,9 @@ Monitors https://apps.mcso.us/PAID/ for specific names in:
 Posts to Slack when matches are found, remembers bookings to avoid duplicates.
 """
 
+__version__ = "0.2.0"
+
+import argparse
 import os
 import json
 import time
@@ -27,6 +30,14 @@ import urllib3
 
 # Disable SSL warnings since MCSO site has certificate chain issues
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Global debug flag
+DEBUG = False
+
+# Error tracking state
+ERROR_REPORT_INTERVAL_HOURS = 4
+last_error_report_time = None
+failure_count = 0
 
 
 class LegacySSLAdapter(HTTPAdapter):
@@ -79,6 +90,12 @@ def log(message: str) -> None:
     print(f"[{timestamp}] {message}", flush=True)
 
 
+def debug_log(message: str) -> None:
+    """Print debug message only if DEBUG mode is enabled."""
+    if DEBUG:
+        log(f"[DEBUG] {message}")
+
+
 def load_seen_bookings() -> dict:
     """Load previously seen bookings from file."""
     try:
@@ -124,6 +141,49 @@ def send_slack_message(message: str) -> None:
             log(f"Slack webhook returned status {response.status_code}")
     except requests.RequestException as e:
         log(f"Error sending Slack message: {e}")
+
+
+def report_scraping_error(error_type: str, error_details: str) -> None:
+    """
+    Report a scraping error to Slack, rate-limited to once every 4 hours.
+    Tracks failure count which is reset on success.
+    """
+    global last_error_report_time, failure_count
+    
+    failure_count += 1
+    log(f"Scraping error ({error_type}): {error_details} [failure #{failure_count}]")
+    
+    now = datetime.now()
+    
+    # Check if we should send a Slack notification
+    should_report = False
+    if last_error_report_time is None:
+        should_report = True
+    else:
+        hours_since_last_report = (now - last_error_report_time).total_seconds() / 3600
+        if hours_since_last_report >= ERROR_REPORT_INTERVAL_HOURS:
+            should_report = True
+    
+    if should_report:
+        message = f"⚠️ *SCRAPER ERROR*\n"
+        message += f"*Error Type:* {error_type}\n"
+        message += f"*Details:* {error_details}\n"
+        message += f"*Failure Count:* {failure_count} since last success\n"
+        message += f"_Next error report in {ERROR_REPORT_INTERVAL_HOURS} hours if errors persist_"
+        
+        send_slack_message(message)
+        last_error_report_time = now
+    else:
+        hours_until_next = ERROR_REPORT_INTERVAL_HOURS - (now - last_error_report_time).total_seconds() / 3600
+        debug_log(f"Suppressing error report (next report in {hours_until_next:.1f} hours)")
+
+
+def reset_failure_count() -> None:
+    """Reset the failure count after a successful scrape."""
+    global failure_count
+    if failure_count > 0:
+        log(f"Scraping recovered after {failure_count} failures")
+        failure_count = 0
 
 
 def name_matches(first_name: str, last_name: str, watch_names: list) -> bool:
@@ -175,10 +235,12 @@ def get_form_fields(soup: BeautifulSoup) -> dict:
     return fields
 
 
-def parse_results_table(soup: BeautifulSoup) -> list:
-    """Parse the results table and extract inmate records."""
-    records = []
-    
+def parse_results_table(soup: BeautifulSoup) -> list | None:
+    """
+    Parse the results table and extract inmate records.
+    Returns None if no table found (indicates potential blocking/error).
+    Returns empty list if table exists but has no records.
+    """
     # Find the search-results table
     table = soup.find("table", {"class": "search-results"})
     if not table:
@@ -186,10 +248,11 @@ def parse_results_table(soup: BeautifulSoup) -> list:
         table = soup.find("table")
     
     if not table:
-        log("No table found on page!")
-        return records
+        debug_log("No table found on page!")
+        return None  # Signal that something is wrong
     
-    log(f"Found table with class={table.get('class')}")
+    debug_log(f"Found table with class={table.get('class')}")
+    records = []
     
     # Get rows from tbody if present, otherwise all tr elements
     tbody = table.find("tbody")
@@ -200,7 +263,7 @@ def parse_results_table(soup: BeautifulSoup) -> list:
         all_rows = table.find_all("tr")
         rows = all_rows[1:] if len(all_rows) > 1 else []
     
-    log(f"Found {len(rows)} data rows")
+    debug_log(f"Found {len(rows)} data rows")
     
     # Parse each row
     for row in rows:
@@ -243,16 +306,19 @@ def parse_results_table(soup: BeautifulSoup) -> list:
         }
         
         records.append(record)
-        log(f"  Found: {last_name}, {first_name} (#{booking_number}) - {booking_date}")
+        debug_log(f"  Found: {last_name}, {first_name} (#{booking_number}) - {booking_date}")
     
     if not records:
-        log("No records found in table")
+        debug_log("No records found in table")
     
     return records
 
 
-def fetch_booked_today(seen: dict) -> list:
-    """Fetch and parse 'Booked Today' results."""
+def fetch_booked_today(seen: dict) -> tuple[list, bool]:
+    """
+    Fetch and parse 'Booked Today' results.
+    Returns (matches, success) tuple.
+    """
     log("Checking 'Booked Today'...")
     matches = []
     
@@ -264,22 +330,31 @@ def fetch_booked_today(seen: dict) -> list:
             "SearchType": SEARCH_TYPE_BOOKED_TODAY
         }
         
-        log(f"Submitting search: SearchType={SEARCH_TYPE_BOOKED_TODAY} (Booked Today)")
+        debug_log(f"Submitting search: SearchType={SEARCH_TYPE_BOOKED_TODAY} (Booked Today)")
         
         response = session.post(SEARCH_URL, data=form_data, timeout=60, verify=False)
         response.raise_for_status()
         
-        log(f"Response status: {response.status_code}, length: {len(response.text)}")
+        debug_log(f"Response status: {response.status_code}, length: {len(response.text)}")
         
         soup = BeautifulSoup(response.text, "lxml")
         
-        # DEBUG: Save response HTML for inspection
-        debug_file = Path(DATA_FILE).parent / "debug_booked_today.html"
-        with open(debug_file, "w") as f:
-            f.write(response.text)
-        log(f"Saved response HTML to {debug_file}")
+        # Save response HTML for inspection (only in debug mode)
+        if DEBUG:
+            debug_file = Path(DATA_FILE).parent / "debug_booked_today.html"
+            with open(debug_file, "w") as f:
+                f.write(response.text)
+            debug_log(f"Saved response HTML to {debug_file}")
         
         records = parse_results_table(soup)
+        
+        # Check if table was found
+        if records is None:
+            report_scraping_error(
+                "No Results Table",
+                "Could not find results table on 'Booked Today' page - site may have changed or be blocking requests"
+            )
+            return matches, False
         
         log(f"Found {len(records)} records in 'Booked Today'")
         
@@ -306,18 +381,35 @@ def fetch_booked_today(seen: dict) -> list:
                     
                     send_slack_message(message)
                 else:
-                    log(f"Already seen booking for {last_name}, {first_name}")
+                    debug_log(f"Already seen booking for {last_name}, {first_name}")
+        
+        return matches, True
     
+    except requests.HTTPError as e:
+        report_scraping_error(
+            f"HTTP Error {e.response.status_code if e.response else 'Unknown'}",
+            f"Failed to fetch 'Booked Today': {e}"
+        )
+        return matches, False
     except requests.RequestException as e:
-        log(f"Error fetching 'Booked Today': {e}")
+        report_scraping_error(
+            "Connection Error",
+            f"Failed to connect for 'Booked Today': {e}"
+        )
+        return matches, False
     except Exception as e:
-        log(f"Error processing 'Booked Today': {e}")
-    
-    return matches
+        report_scraping_error(
+            "Processing Error",
+            f"Error processing 'Booked Today': {e}"
+        )
+        return matches, False
 
 
-def fetch_released_last_7_days(seen: dict) -> list:
-    """Fetch and parse 'Released Last 7 Days' results."""
+def fetch_released_last_7_days(seen: dict) -> tuple[list, bool]:
+    """
+    Fetch and parse 'Released Last 7 Days' results.
+    Returns (matches, success) tuple.
+    """
     log("Checking 'Released Last 7 Days'...")
     matches = []
     
@@ -329,22 +421,31 @@ def fetch_released_last_7_days(seen: dict) -> list:
             "SearchType": SEARCH_TYPE_RELEASED_LAST_7_DAYS
         }
         
-        log(f"Submitting search: SearchType={SEARCH_TYPE_RELEASED_LAST_7_DAYS} (Released Last 7 Days)")
+        debug_log(f"Submitting search: SearchType={SEARCH_TYPE_RELEASED_LAST_7_DAYS} (Released Last 7 Days)")
         
         response = session.post(SEARCH_URL, data=form_data, timeout=60, verify=False)
         response.raise_for_status()
         
-        log(f"Response status: {response.status_code}, length: {len(response.text)}")
+        debug_log(f"Response status: {response.status_code}, length: {len(response.text)}")
         
         soup = BeautifulSoup(response.text, "lxml")
         
-        # DEBUG: Save response HTML for inspection
-        debug_file = Path(DATA_FILE).parent / "debug_released_7_days.html"
-        with open(debug_file, "w") as f:
-            f.write(response.text)
-        log(f"Saved response HTML to {debug_file}")
+        # Save response HTML for inspection (only in debug mode)
+        if DEBUG:
+            debug_file = Path(DATA_FILE).parent / "debug_released_7_days.html"
+            with open(debug_file, "w") as f:
+                f.write(response.text)
+            debug_log(f"Saved response HTML to {debug_file}")
         
         records = parse_results_table(soup)
+        
+        # Check if table was found
+        if records is None:
+            report_scraping_error(
+                "No Results Table",
+                "Could not find results table on 'Released Last 7 Days' page - site may have changed or be blocking requests"
+            )
+            return matches, False
         
         log(f"Found {len(records)} records in 'Released Last 7 Days'")
         
@@ -371,14 +472,28 @@ def fetch_released_last_7_days(seen: dict) -> list:
                     
                     send_slack_message(message)
                 else:
-                    log(f"Already seen release for {last_name}, {first_name}")
+                    debug_log(f"Already seen release for {last_name}, {first_name}")
+        
+        return matches, True
     
+    except requests.HTTPError as e:
+        report_scraping_error(
+            f"HTTP Error {e.response.status_code if e.response else 'Unknown'}",
+            f"Failed to fetch 'Released Last 7 Days': {e}"
+        )
+        return matches, False
     except requests.RequestException as e:
-        log(f"Error fetching 'Released Last 7 Days': {e}")
+        report_scraping_error(
+            "Connection Error",
+            f"Failed to connect for 'Released Last 7 Days': {e}"
+        )
+        return matches, False
     except Exception as e:
-        log(f"Error processing 'Released Last 7 Days': {e}")
-    
-    return matches
+        report_scraping_error(
+            "Processing Error",
+            f"Error processing 'Released Last 7 Days': {e}"
+        )
+        return matches, False
 
 
 def run_check(seen: dict) -> None:
@@ -386,16 +501,41 @@ def run_check(seen: dict) -> None:
     log("=" * 50)
     log("Starting check cycle...")
     
-    fetch_booked_today(seen)
-    fetch_released_last_7_days(seen)
+    _, booked_success = fetch_booked_today(seen)
+    _, released_success = fetch_released_last_7_days(seen)
+    
+    # Reset failure count if both succeeded
+    if booked_success and released_success:
+        reset_failure_count()
+    
     save_seen_bookings(seen)
     
     log("Check cycle complete")
 
 
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="MCSO PAID (Public Access Inmate Data) Scraper"
+    )
+    parser.add_argument(
+        "-d", "--debug",
+        action="store_true",
+        help="Enable debug output"
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
     """Main entry point."""
-    log("MCSO PAID Scraper starting...")
+    global DEBUG
+    
+    args = parse_args()
+    DEBUG = args.debug
+    
+    log(f"MCSO PAID Scraper v{__version__} starting...")
+    if DEBUG:
+        log("Debug mode enabled")
     
     # Validate configuration
     if not WATCH_NAMES:
