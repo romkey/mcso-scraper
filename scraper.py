@@ -9,7 +9,7 @@ Monitors https://apps.mcso.us/PAID/ for specific names in:
 Posts to Slack when matches are found, remembers bookings to avoid duplicates.
 """
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 import argparse
 import os
@@ -547,6 +547,11 @@ def parse_args():
         action="store_true",
         help="Enable debug output"
     )
+    parser.add_argument(
+        "--test-slack",
+        action="store_true",
+        help="Send a test message to Slack on startup"
+    )
     return parser.parse_args()
 
 
@@ -572,6 +577,16 @@ def main() -> None:
         log("WARNING: No Slack webhook configured. Messages will be printed to stdout.")
     else:
         log("Slack webhook configured")
+    
+    # Send test message if requested
+    if args.test_slack:
+        log("Sending Slack test message...")
+        test_msg = f"🧪 *MCSO Scraper Test*\nVersion: v{__version__}\nWatching for: {', '.join(WATCH_NAMES)}\n_This is a test message to verify Slack integration._"
+        if send_slack_message(test_msg):
+            log("Test message sent successfully!")
+        else:
+            log("Test message FAILED - check webhook URL")
+            sys.exit(1)
     
     log(f"Poll interval: {POLL_INTERVAL_MINUTES} minutes")
     log(f"Data file: {DATA_FILE}")
