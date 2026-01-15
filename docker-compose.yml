@@ -1,0 +1,13 @@
+services:
+  mcso-scraper:
+    build: .
+    container_name: mcso-scraper
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist seen bookings data
+      - ./data:/app/data
+    environment:
+      - TZ=America/Phoenix  # Arizona timezone
+
