@@ -9,7 +9,7 @@ Monitors https://apps.mcso.us/PAID/ for specific names in:
 Posts to Slack when matches are found, remembers bookings to avoid duplicates.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 import argparse
 import os
@@ -123,11 +123,20 @@ def save_seen_bookings(seen: dict) -> None:
         log(f"Error saving seen bookings: {e}")
 
 
-def send_slack_message(message: str) -> None:
-    """Send message to Slack webhook or stdout if no webhook configured."""
+def send_slack_message(message: str) -> bool:
+    """
+    Send message to Slack webhook or stdout if no webhook configured.
+    Returns True if message was sent successfully, False otherwise.
+    """
     if not SLACK_WEBHOOK_URL:
+        log("[SLACK] No webhook configured, printing message instead:")
         log(f"[SLACK MESSAGE] {message}")
-        return
+        return True
+    
+    # Mask the webhook URL for logging (show first 40 chars + ...)
+    masked_url = SLACK_WEBHOOK_URL[:40] + "..." if len(SLACK_WEBHOOK_URL) > 40 else SLACK_WEBHOOK_URL
+    log(f"[SLACK] Attempting to post to webhook: {masked_url}")
+    debug_log(f"[SLACK] Message length: {len(message)} chars")
     
     try:
         response = requests.post(
@@ -135,12 +144,27 @@ def send_slack_message(message: str) -> None:
             json={"text": message},
             timeout=10
         )
+        
         if response.status_code == 200:
-            log("Slack message sent successfully")
+            log("[SLACK] Message sent successfully (HTTP 200)")
+            return True
         else:
-            log(f"Slack webhook returned status {response.status_code}")
+            log(f"[SLACK] FAILED - HTTP status {response.status_code}")
+            log(f"[SLACK] Response body: {response.text[:500]}")
+            return False
+            
+    except requests.Timeout:
+        log("[SLACK] FAILED - Request timed out after 10 seconds")
+        return False
+    except requests.ConnectionError as e:
+        log(f"[SLACK] FAILED - Connection error: {e}")
+        return False
     except requests.RequestException as e:
-        log(f"Error sending Slack message: {e}")
+        log(f"[SLACK] FAILED - Request error: {e}")
+        return False
+    except Exception as e:
+        log(f"[SLACK] FAILED - Unexpected error: {type(e).__name__}: {e}")
+        return False
 
 
 def report_scraping_error(error_type: str, error_details: str) -> None:
